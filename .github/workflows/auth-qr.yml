@@ -76,6 +76,12 @@ jobs:
             qr_screen.png
             login_screen.png
             qr_window.xml
+            drawer.png
+            ui_drawer.xml
+            drawer_try_*.png
+            auth_screen_check.txt
+            find_login.log
+            find_menu.log
           if-no-files-found: warn
 
       - name: Upload auth state artifact
