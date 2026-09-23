@@ -7,6 +7,10 @@ on:
         description: "Search query"
         required: false
         default: "АЗС"
+      query_b64:
+        description: "Search query, base64 UTF-8 (takes precedence over query; avoids encoding issues)"
+        required: false
+        default: "0JDQl9Ch"
       latitude:
         description: "Latitude to set as GPS location"
         required: false
@@ -70,6 +74,7 @@ jobs:
         uses: reactivecircus/android-emulator-runner@v2.38.0
         env:
           QUERY: ${{ inputs.query }}
+          QUERY_B64: ${{ inputs.query_b64 }}
           LAT: ${{ inputs.latitude }}
           LON: ${{ inputs.longitude }}
         with:
