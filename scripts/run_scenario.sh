@@ -108,7 +108,16 @@ if [ "$SEARCH_METHOD" = "uiautomator" ]; then
   dump_ui || true
   if grep -q "$QUERY" window.xml 2>/dev/null; then
     echo "query text confirmed in UI"
-    adb shell input keyevent 66
+    # try to tap the Search submit button; fall back to Enter key
+    if python3 scripts/find_button.py window.xml > submit.txt 2> find_button.log; then
+      cat find_button.log 2>/dev/null || true
+      read -r SX SY < submit.txt
+      echo "tapping submit button at ($SX,$SY)"
+      adb shell input tap "$SX" "$SY"
+    else
+      echo "submit button not found, sending Enter"
+      adb shell input keyevent 66
+    fi
   else
     echo "query NOT visible after typing, falling back to deep link"
     SEARCH_METHOD=deeplink
