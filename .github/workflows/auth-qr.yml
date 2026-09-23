@@ -1,0 +1,98 @@
+name: Yandex Maps QR Auth Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_wait_minutes:
+        description: "How long to wait for manual QR scan (minutes)"
+        required: false
+        default: "15"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  qr-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Download Yandex Maps APK
+        run: |
+          set -euo pipefail
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          PAGE="https://apk.gold/download?file_id=2940825/yandex-maps"
+
+          echo "=== resolving direct APK url from $PAGE ==="
+          curl -sSL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA" "$PAGE" -o page.html
+          B64=$(grep -oP '(?<=&b=)[A-Za-z0-9+/=]+' page.html | head -n1)
+          if [ -z "${B64:-}" ]; then
+            echo "::error::signed download link not found on page"
+            exit 1
+          fi
+          URL=$(printf '%s' "$B64" | base64 -d)
+          echo "direct url: $URL"
+
+          echo "=== downloading APK ==="
+          curl -L --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA" "$URL" -o YandexMaps.apk \
+            -w "http=%{http_code} size=%{size_download}\n"
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          echo "5a3cfdfc7135591247af156c6731471351c107e6cf510298b47b0bbe064f864b  YandexMaps.apk" | sha256sum -c -
+          unzip -l YandexMaps.apk | grep -q 'lib/x86_64/' || { echo "::error::no x86_64 libs"; exit 1; }
+
+      - name: Run emulator, open login, publish QR, wait for manual scan
+        uses: reactivecircus/android-emulator-runner@v2.38.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCAN_WAIT: ${{ inputs.scan_wait_minutes }}
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          # NOTE: script runs line-by-line via sh -c; all logic is in the bash file.
+          script: bash scripts/qr_auth.sh
+
+      - name: Upload QR artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yandex-maps-qr
+          path: |
+            qr_screen.png
+            login_screen.png
+            qr_window.xml
+          if-no-files-found: warn
+
+      - name: Upload auth state artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yandex-maps-auth-state
+          path: |
+            auth-result.json
+            authenticated.png
+            authenticated.xml
+            logcat.txt
+            state-info.txt
+            app-data-yandexmaps.tar.gz
+            android-state.tar.gz
+            snapshot_save.txt
+            snapshot_list.txt
+            root_check.txt
+            avd_size.txt
+          if-no-files-found: warn
