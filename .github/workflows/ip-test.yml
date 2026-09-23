@@ -1,0 +1,186 @@
+name: GitHub Runner IP Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Runner info and public IP before Android
+        run: |
+          set -uo pipefail
+          INSTANCE=${{ matrix.instance }}
+          echo "INSTANCE=$INSTANCE"
+          {
+            echo "instance=$INSTANCE"
+            echo "hostname=$(hostname)"
+            echo "runner_name=$RUNNER_NAME"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "job_id=${{ github.job }}"
+            echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "started_epoch=$(date +%s)"
+            uname -a
+            cat /etc/os-release
+          } > runner_info.txt
+          {
+            echo "ipify: $(curl -4 -s --max-time 20 https://api.ipify.org)"
+            echo "ifconfig.me: $(curl -4 -s --max-time 20 https://ifconfig.me)"
+            echo "icanhazip: $(curl -4 -s --max-time 20 https://icanhazip.com)"
+          } | tee ip_services.txt
+
+      - name: Run Android Emulator and collect network info
+        uses: reactivecircus/android-emulator-runner@v2.38.0
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: adb shell ip addr > android_ip.txt && adb shell ip route > android_route.txt && curl -4 -s https://api.ipify.org > ip_after_ipify.txt && curl -4 -s https://ifconfig.me > ip_after_ifconfig.txt && curl -4 -s https://icanhazip.com > ip_after_icanhazip.txt
+
+      - name: Build result.json
+        run: |
+          set -uo pipefail
+          INSTANCE=${{ matrix.instance }}
+          IP_BEFORE=$(curl -4 -s --max-time 20 https://api.ipify.org)
+          IP_AFTER=$(cat ip_after_ipify.txt)
+          ANDROID_OK=false
+          [ -s android_ip.txt ] && ANDROID_OK=true
+          python3 - <<EOF
+          import json, os
+          instance = "$INSTANCE"
+          ip_before = "$IP_BEFORE"
+          ip_after = "$IP_AFTER"
+          res = {
+              "instance": int(instance),
+              "run_id": "$GITHUB_RUN_ID",
+              "job_id": "${{ github.job }}",
+              "hostname": os.uname().nodename,
+              "runner_name": os.environ.get("RUNNER_NAME", ""),
+              "ip_before": ip_before,
+              "ip_after": ip_after,
+              "ip_same_before_after": ip_before == ip_after,
+              "android_network_checked": "$ANDROID_OK" == "true",
+              "started_epoch": int(open("runner_info.txt").read().split("started_epoch=")[1].split()[0]),
+              "ended_epoch": int(__import__("time").time()),
+          }
+          json.dump(res, open("result.json", "w"), indent=2)
+          print(json.dumps(res, indent=2))
+          EOF
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ip-test-${{ matrix.instance }}
+          path: |
+            result.json
+            android_ip.txt
+            android_route.txt
+            runner_info.txt
+            ip_services.txt
+            ip_after_ipify.txt
+            ip_after_ifconfig.txt
+            ip_after_icanhazip.txt
+          if-no-files-found: warn
+
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all matrix artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ip-test-*
+          path: results
+
+      - name: Build ip-summary.json and ip-summary.csv
+        run: |
+          python3 - <<'EOF'
+          import csv, glob, json
+          from collections import defaultdict
+
+          rows = []
+          for p in sorted(glob.glob("results/ip-test-*/result.json")):
+              with open(p, encoding="utf-8") as f:
+                  rows.append(json.load(f))
+
+          rows.sort(key=lambda r: r["instance"])
+          successful = [r for r in rows if r.get("ip_before") and r.get("ip_after")]
+          ips = defaultdict(list)
+          for r in successful:
+              ips[r["ip_after"]].append(r["instance"])
+
+          # parallelism: count max overlapping jobs by [start, end) intervals
+          events = []
+          for r in successful:
+              events.append((r.get("started_epoch", 0), 1))
+              events.append((r.get("ended_epoch", 0), -1))
+          events.sort()
+          cur = peak = 0
+          for _, d in events:
+              cur += d
+              peak = max(peak, cur)
+
+          summary = {
+              "total_runs": len(rows),
+              "successful_runs": len(successful),
+              "unique_public_ipv4": len(ips),
+              "max_concurrent_jobs": peak,
+              "results": [
+                  {"instance": r["instance"], "ip": r["ip_after"],
+                   "ip_before": r["ip_before"], "hostname": r["hostname"],
+                   "run_id": r["run_id"], "job_id": r.get("job_id", "")}
+                  for r in rows
+              ],
+              "ip_groups": {ip: v for ip, v in sorted(ips.items(), key=lambda kv: -len(kv[1]))},
+          }
+          with open("ip-summary.json", "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2)
+
+          with open("ip-summary.csv", "w", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              w.writerow(["instance", "run_id", "hostname", "ip_before", "ip_after", "android_ip_info"])
+              for r in rows:
+                  try:
+                      aip = open(f"results/ip-test-{r['instance']}/android_ip.txt", encoding="utf-8", errors="replace").read()[:200]
+                  except OSError:
+                      aip = ""
+                  w.writerow([r["instance"], r["run_id"], r["hostname"],
+                              r.get("ip_before", ""), r.get("ip_after", ""), aip.strip()])
+
+          print(json.dumps(summary, indent=2))
+          print("\n=== ANALYSIS ===")
+          print(f"Total runs: {summary['total_runs']}")
+          print(f"Successful: {summary['successful_runs']}")
+          print(f"Unique public IPv4: {summary['unique_public_ipv4']}")
+          print(f"Max concurrent jobs: {peak}")
+          for ip, inst in summary["ip_groups"].items():
+              print(f"{ip} -> instances {inst}")
+          EOF
+
+      - name: Upload summary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ip-summary
+          path: |
+            ip-summary.json
+            ip-summary.csv
+          if-no-files-found: error
