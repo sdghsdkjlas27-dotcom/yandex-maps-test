@@ -1,0 +1,139 @@
+name: Yandex Maps on Android Emulator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  yandex-maps-screenshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Download Yandex Maps APK
+        run: |
+          set -euo pipefail
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          PAGE="https://apk.gold/download?file_id=2940825/yandex-maps"
+
+          echo "=== resolving direct APK url from $PAGE ==="
+          curl -sSL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA" "$PAGE" -o page.html
+          ls -la page.html
+
+          B64=$(grep -oP '(?<=&b=)[A-Za-z0-9+/=]+' page.html | head -n1)
+          if [ -z "${B64:-}" ]; then
+            echo "::error::signed download link not found on page"
+            exit 1
+          fi
+          URL=$(printf '%s' "$B64" | base64 -d)
+          echo "direct url: $URL"
+
+          echo "=== downloading APK ==="
+          curl -L --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA" "$URL" -o YandexMaps.apk \
+            -w "http=%{http_code} size=%{size_download}\n"
+          ls -la YandexMaps.apk
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          echo "=== file type ==="
+          file YandexMaps.apk
+
+          echo "=== sha256 ==="
+          echo "5a3cfdfc7135591247af156c6731471351c107e6cf510298b47b0bbe064f864b  YandexMaps.apk" | sha256sum -c -
+
+          echo "=== native libs ==="
+          unzip -l YandexMaps.apk | grep -E 'lib/(x86_64|x86)/' | head -20
+          unzip -l YandexMaps.apk | grep -q 'lib/x86_64/' || { echo "::error::APK has no x86_64 native libs"; exit 1; }
+
+          echo "=== badging ==="
+          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt 2>/dev/null | tail -n1 || true)
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | tail -n1 || true)
+          if [ -n "$AAPT" ]; then
+            "$AAPT" dump badging YandexMaps.apk | head -5
+          elif [ -n "$AAPT2" ]; then
+            "$AAPT2" dump badging YandexMaps.apk | head -5
+          else
+            echo "aapt/aapt2 not found, skipping badging"
+          fi
+
+      - name: Run emulator, install Yandex Maps, take screenshot
+        uses: reactivecircus/android-emulator-runner@v2.38.0
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            set +e
+            trap 'echo "=== trap: capturing diagnostics ==="; adb logcat -d > logcat.txt 2>/dev/null; adb exec-out screencap -p > screenshot.png 2>/dev/null' EXIT
+
+            echo "=== adb devices ==="
+            adb devices
+
+            echo "=== install Yandex Maps ==="
+            adb install -r -g YandexMaps.apk
+            echo "install exit code: $?"
+
+            echo "=== installed packages ==="
+            adb shell pm list packages | grep yandex || true
+
+            echo "=== grant location permissions ==="
+            adb shell pm grant ru.yandex.yandexmaps android.permission.ACCESS_FINE_LOCATION 2>/dev/null
+            adb shell pm grant ru.yandex.yandexmaps android.permission.ACCESS_COARSE_LOCATION 2>/dev/null
+
+            echo "=== launch ru.yandex.yandexmaps ==="
+            adb shell monkey -p ru.yandex.yandexmaps 1
+
+            echo "=== waiting 45s for app to load ==="
+            sleep 45
+
+            echo "=== resumed activity ==="
+            adb shell dumpsys activity activities | grep -i yandex || true
+            adb shell dumpsys window | grep -i mCurrentFocus || true
+
+            echo "=== screencap ==="
+            adb exec-out screencap -p > screenshot.png
+            ls -la screenshot.png
+
+            echo "=== logcat ==="
+            adb logcat -d > logcat.txt
+            ls -la logcat.txt
+
+            trap - EXIT
+
+      - name: Validate screenshot
+        run: |
+          ls -la screenshot.png || true
+          file screenshot.png || true
+          SIZE=$(stat -c%s screenshot.png 2>/dev/null || echo 0)
+          echo "screenshot size: $SIZE bytes"
+          if [ "$SIZE" -lt 10240 ]; then
+            echo "::error::screenshot.png is missing or too small"
+            exit 1
+          fi
+
+      - name: Upload screenshot artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yandex-maps-screenshot
+          path: screenshot.png
+          if-no-files-found: warn
+
+      - name: Upload logcat artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yandex-maps-logcat
+          path: logcat.txt
+          if-no-files-found: warn
